@@ -1,0 +1,4 @@
+Model,Avg FPS,Total Faces Found,Relative Capture Rate (%),Total Processing Time (s)
+MTCNN,2.92,300,100.0,51.35
+RetinaFace,1.23,300,100.0,121.84
+YOLOv8,86.02,300,100.0,1.74
