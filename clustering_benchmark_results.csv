@@ -1,0 +1,5 @@
+Model,Clusters_Found,Target_Clusters,Noise_Faces,ARI_Score,Silhouette_Score
+K-Means,20,20,0,0.9258,0.3584
+DBSCAN,23,20,28,0.8827,0.416
+HDBSCAN,20,20,9,0.9676,0.4116
+Agglomerative,55,20,0,0.8873,0.2598
