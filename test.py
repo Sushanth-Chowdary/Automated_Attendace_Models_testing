@@ -1,10 +1,9 @@
 import os
-import shutil
-import kagglehub
 import torch
 import numpy as np
 import pandas as pd
 from PIL import Image
+import kagglehub
 from facenet_pytorch import MTCNN, InceptionResnetV1
 from sklearn.preprocessing import normalize
 from sklearn.cluster import KMeans, DBSCAN, AgglomerativeClustering
@@ -14,21 +13,17 @@ import hdbscan
 # ==========================================
 # 1. SETUP & DATASET DOWNLOAD
 # ==========================================
-# Your specific SMB network share path
+# Your specific SMB network share path (ONLY used for saving the CSV results)
 BASE_DIR = "/run/user/1000/gvfs/smb-share:server=10.23.20.56,share=rkgnas_user2/EE23B044_testing"
-DATASET_DIR = os.path.join(BASE_DIR, "lfw-dataset")
 RESULTS_FILE = os.path.join(BASE_DIR, "clustering_benchmark_results.csv")
 
 print("--- Phase 1: Dataset Acquisition ---")
-if not os.path.exists(DATASET_DIR):
-    print("Downloading LFW dataset to local cache...")
-    cached_path = kagglehub.dataset_download("jessicali9530/lfw-dataset")
-    print(f"Moving files from cache to network share: {DATASET_DIR}")
-    # Note: LFW has ~13,000 files. Moving to an SMB share will take a few minutes.
-    shutil.copytree(cached_path, DATASET_DIR, dirs_exist_ok=True)
-    print("Download and transfer complete!")
-else:
-    print(f"Dataset already exists at {DATASET_DIR}. Skipping download.")
+print("Downloading/Locating LFW dataset in local cache...")
+cached_path = kagglehub.dataset_download("jessicali9530/lfw-dataset")
+
+# The Kaggle LFW dataset nests the images deep inside these folders
+DATASET_DIR = os.path.join(cached_path, "lfw-deepfunneled", "lfw-deepfunneled")
+print(f"Reading images directly from local cache: {DATASET_DIR}")
 
 # ==========================================
 # 2. MODEL INITIALIZATION
@@ -39,10 +34,7 @@ print(f"Active Device: {device}")
 if device.type == 'cuda':
     print(f"GPU Name: {torch.cuda.get_device_name(0)}")
 
-# MTCNN: keep_all=False ensures it only grabs the single most prominent face per image
 mtcnn = MTCNN(image_size=160, margin=0, keep_all=False, device=device)
-
-# FaceNet: InceptionResnetV1 outputs 512-d embeddings
 resnet = InceptionResnetV1(pretrained='vggface2').eval().to(device)
 
 # ==========================================
@@ -54,15 +46,12 @@ true_labels = []
 label_map = {}
 current_label_id = 0
 
-# The LFW dataset has a subfolder for each person.
-# To keep the benchmark fast, we will only evaluate people with at least 10 images.
 MIN_FACES_PER_PERSON = 10 
 
 for person_name in os.listdir(DATASET_DIR):
     person_dir = os.path.join(DATASET_DIR, person_name)
     if not os.path.isdir(person_dir): continue
     
-    # Count images in the folder
     images = [f for f in os.listdir(person_dir) if f.endswith(('.jpg', '.png'))]
     if len(images) < MIN_FACES_PER_PERSON:
         continue
@@ -73,7 +62,7 @@ for person_name in os.listdir(DATASET_DIR):
         img_path = os.path.join(person_dir, image_name)
         try:
             img = Image.open(img_path).convert('RGB')
-            face_tensor = mtcnn(img) # Detect and crop
+            face_tensor = mtcnn(img) 
             
             if face_tensor is not None:
                 face_batch = face_tensor.unsqueeze(0).to(device)
@@ -83,10 +72,10 @@ for person_name in os.listdir(DATASET_DIR):
                 embeddings.append(embedding)
                 true_labels.append(current_label_id)
         except Exception as e:
-            pass # Skip corrupted images silently
+            pass 
             
     current_label_id += 1
-    # Stop after we get 20 valid students to keep the benchmark fast and readable
+    # Limiting to 20 students for the benchmark speed
     if current_label_id >= 20: 
         break
 
@@ -96,7 +85,6 @@ num_known_students = len(np.unique(true_labels))
 
 print(f"Extracted {len(X)} valid faces across {num_known_students} people.")
 
-# Normalize the embeddings (CRITICAL for FaceNet)
 X_normalized = normalize(X, norm='l2')
 
 # ==========================================
@@ -131,7 +119,6 @@ for name, model in models.items():
     print(f"[{name}]")
     print(f"  Clusters: {n_clusters_found}/{num_known_students} | Noise: {noise_points} | ARI: {ari:.3f} | Silhouette: {sil:.3f}")
     
-    # Store for CSV export
     results_data.append({
         "Model": name,
         "Clusters_Found": n_clusters_found,
@@ -146,5 +133,7 @@ for name, model in models.items():
 # ==========================================
 print("\n--- Phase 5: Exporting Results ---")
 df = pd.DataFrame(results_data)
+# Ensure the network directory exists before writing
+os.makedirs(BASE_DIR, exist_ok=True)
 df.to_csv(RESULTS_FILE, index=False)
 print(f"Benchmark complete! Results saved to: {RESULTS_FILE}")
