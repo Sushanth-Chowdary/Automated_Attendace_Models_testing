@@ -1,107 +1,150 @@
 import os
+import shutil
+import kagglehub
 import torch
 import numpy as np
+import pandas as pd
 from PIL import Image
 from facenet_pytorch import MTCNN, InceptionResnetV1
 from sklearn.preprocessing import normalize
-from sklearn.cluster import KMeans, DBSCAN
+from sklearn.cluster import KMeans, DBSCAN, AgglomerativeClustering
 from sklearn.metrics import silhouette_score, adjusted_rand_score
 import hdbscan
 
-# 1. Initialize Models
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f"Running on device: {device}")
+# ==========================================
+# 1. SETUP & DATASET DOWNLOAD
+# ==========================================
+# Your specific SMB network share path
+BASE_DIR = "/run/user/1000/gvfs/smb-share:server=10.23.20.56,share=rkgnas_user2/EE23B044_testing"
+DATASET_DIR = os.path.join(BASE_DIR, "lfw-dataset")
+RESULTS_FILE = os.path.join(BASE_DIR, "clustering_benchmark_results.csv")
 
-# MTCNN detects faces and crops them to 160x160 (required by FaceNet)
+print("--- Phase 1: Dataset Acquisition ---")
+if not os.path.exists(DATASET_DIR):
+    print("Downloading LFW dataset to local cache...")
+    cached_path = kagglehub.dataset_download("jessicali9530/lfw-dataset")
+    print(f"Moving files from cache to network share: {DATASET_DIR}")
+    # Note: LFW has ~13,000 files. Moving to an SMB share will take a few minutes.
+    shutil.copytree(cached_path, DATASET_DIR, dirs_exist_ok=True)
+    print("Download and transfer complete!")
+else:
+    print(f"Dataset already exists at {DATASET_DIR}. Skipping download.")
+
+# ==========================================
+# 2. MODEL INITIALIZATION
+# ==========================================
+print("\n--- Phase 2: Model Initialization ---")
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Active Device: {device}")
+if device.type == 'cuda':
+    print(f"GPU Name: {torch.cuda.get_device_name(0)}")
+
+# MTCNN: keep_all=False ensures it only grabs the single most prominent face per image
 mtcnn = MTCNN(image_size=160, margin=0, keep_all=False, device=device)
 
-# InceptionResnetV1 pretrained on vggface2 outputs 512-dimensional embeddings
+# FaceNet: InceptionResnetV1 outputs 512-d embeddings
 resnet = InceptionResnetV1(pretrained='vggface2').eval().to(device)
 
-def extract_embeddings_from_dataset(dataset_path):
-    embeddings = []
-    true_labels = []
-    label_to_name = {}
+# ==========================================
+# 3. EMBEDDING EXTRACTION
+# ==========================================
+print("\n--- Phase 3: Extracting 512-d Embeddings ---")
+embeddings = []
+true_labels = []
+label_map = {}
+current_label_id = 0
+
+# The LFW dataset has a subfolder for each person.
+# To keep the benchmark fast, we will only evaluate people with at least 10 images.
+MIN_FACES_PER_PERSON = 10 
+
+for person_name in os.listdir(DATASET_DIR):
+    person_dir = os.path.join(DATASET_DIR, person_name)
+    if not os.path.isdir(person_dir): continue
     
-    current_label_id = 0
+    # Count images in the folder
+    images = [f for f in os.listdir(person_dir) if f.endswith(('.jpg', '.png'))]
+    if len(images) < MIN_FACES_PER_PERSON:
+        continue
+        
+    label_map[current_label_id] = person_name
     
-    # Loop through each person's folder
-    for person_name in os.listdir(dataset_path):
-        person_dir = os.path.join(dataset_path, person_name)
-        if not os.path.isdir(person_dir): continue
-        
-        label_to_name[current_label_id] = person_name
-        
-        for image_name in os.listdir(person_dir):
-            img_path = os.path.join(person_dir, image_name)
-            try:
-                img = Image.open(img_path).convert('RGB')
-                
-                # Detect and crop the face using MTCNN
-                face_tensor = mtcnn(img)
-                
-                if face_tensor is not None:
-                    # MTCNN outputs a tensor of shape (3, 160, 160)
-                    # Resnet expects a batch dimension: (1, 3, 160, 160)
-                    face_batch = face_tensor.unsqueeze(0).to(device)
-                    
-                    # Generate 512-d embedding
-                    with torch.no_grad():
-                        embedding = resnet(face_batch).cpu().numpy()[0]
-                        
-                    embeddings.append(embedding)
-                    true_labels.append(current_label_id)
-            except Exception as e:
-                print(f"Could not process {img_path}: {e}")
-                
-        current_label_id += 1
-        
-    return np.array(embeddings), np.array(true_labels), label_to_name
-
-# 2. Process Dataset
-# Replace 'path/to/your/dataset' with the actual folder path
-DATASET_PATH = "path/to/your/dataset" 
-
-print("Processing images and extracting 512-d embeddings...")
-X, true_labels, label_map = extract_embeddings_from_dataset(DATASET_PATH)
-
-print(f"Extracted {len(X)} faces across {len(label_map)} people.")
-
-if len(X) > 0:
-    # 3. L2 Normalize Embeddings (Critical for FaceNet cosine similarity)
-    X_normalized = normalize(X, norm='l2')
-
-    # 4. Initialize Clustering Models
-    num_people = len(label_map)
-    
-    models = {
-        "K-Means": KMeans(n_clusters=num_people, random_state=42, n_init='auto'),
-        # Note: eps tuned for 512-d normalized space; you may need to adjust this (0.4 to 0.8)
-        "DBSCAN": DBSCAN(eps=0.6, min_samples=3), 
-        "HDBSCAN": hdbscan.HDBSCAN(min_cluster_size=3, metric='euclidean')
-    }
-
-    # 5. Evaluate
-    print("\n--- Clustering Evaluation Results ---")
-    for name, model in models.items():
-        predicted_labels = model.fit_predict(X_normalized)
-        
-        ari = adjusted_rand_score(true_labels, predicted_labels)
-        
-        unique_labels = set(predicted_labels)
-        n_clusters_found = len(unique_labels) - (1 if -1 in unique_labels else 0)
-        noise_points = list(predicted_labels).count(-1)
-        
-        mask = predicted_labels != -1
-        if n_clusters_found > 1 and len(X_normalized[mask]) > 0:
-            sil = silhouette_score(X_normalized[mask], predicted_labels[mask])
-        else:
-            sil = -1.0 
+    for image_name in images:
+        img_path = os.path.join(person_dir, image_name)
+        try:
+            img = Image.open(img_path).convert('RGB')
+            face_tensor = mtcnn(img) # Detect and crop
             
-        print(f"\nModel: {name}")
-        print(f" - Clusters Found: {n_clusters_found} (True count: {num_people})")
-        print(f" - Noise Points:   {noise_points} out of {len(X)}")
-        print(f" - ARI:            {ari:.4f} (Closer to 1.0 is better)")
-        print(f" - Silhouette:     {sil:.4f} (Closer to 1.0 is better)")
-else:
-    print("No faces were detected in the dataset. Check your image paths.")
+            if face_tensor is not None:
+                face_batch = face_tensor.unsqueeze(0).to(device)
+                with torch.no_grad():
+                    embedding = resnet(face_batch).cpu().numpy()[0]
+                    
+                embeddings.append(embedding)
+                true_labels.append(current_label_id)
+        except Exception as e:
+            pass # Skip corrupted images silently
+            
+    current_label_id += 1
+    # Stop after we get 20 valid students to keep the benchmark fast and readable
+    if current_label_id >= 20: 
+        break
+
+X = np.array(embeddings)
+true_labels = np.array(true_labels)
+num_known_students = len(np.unique(true_labels))
+
+print(f"Extracted {len(X)} valid faces across {num_known_students} people.")
+
+# Normalize the embeddings (CRITICAL for FaceNet)
+X_normalized = normalize(X, norm='l2')
+
+# ==========================================
+# 4. CLUSTERING BENCHMARK
+# ==========================================
+print("\n--- Phase 4: Clustering Benchmark ---")
+
+models = {
+    "K-Means": KMeans(n_clusters=num_known_students, random_state=42, n_init='auto'),
+    "DBSCAN": DBSCAN(eps=0.7, min_samples=3),
+    "HDBSCAN": hdbscan.HDBSCAN(min_cluster_size=3, metric='euclidean'),
+    "Agglomerative": AgglomerativeClustering(n_clusters=None, distance_threshold=0.8, metric='euclidean', linkage='average')
+}
+
+results_data = []
+
+for name, model in models.items():
+    predicted_labels = model.fit_predict(X_normalized)
+    
+    ari = adjusted_rand_score(true_labels, predicted_labels)
+    
+    unique_labels = set(predicted_labels)
+    noise_points = list(predicted_labels).count(-1)
+    n_clusters_found = len(unique_labels) - (1 if -1 in unique_labels else 0)
+    
+    mask = predicted_labels != -1
+    if n_clusters_found > 1 and len(X_normalized[mask]) > 0:
+        sil = silhouette_score(X_normalized[mask], predicted_labels[mask])
+    else:
+        sil = -1.0
+        
+    print(f"[{name}]")
+    print(f"  Clusters: {n_clusters_found}/{num_known_students} | Noise: {noise_points} | ARI: {ari:.3f} | Silhouette: {sil:.3f}")
+    
+    # Store for CSV export
+    results_data.append({
+        "Model": name,
+        "Clusters_Found": n_clusters_found,
+        "Target_Clusters": num_known_students,
+        "Noise_Faces": noise_points,
+        "ARI_Score": round(ari, 4),
+        "Silhouette_Score": round(sil, 4)
+    })
+
+# ==========================================
+# 5. EXPORT RESULTS
+# ==========================================
+print("\n--- Phase 5: Exporting Results ---")
+df = pd.DataFrame(results_data)
+df.to_csv(RESULTS_FILE, index=False)
+print(f"Benchmark complete! Results saved to: {RESULTS_FILE}")
