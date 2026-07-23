@@ -1,0 +1,5 @@
+Model,Accuracy (%),Train/Index Time (s),Inference Time (ms/face)
+KNN,100.0,0.2447,0.5239
+SVM,100.0,0.233,0.499
+MLP Network,100.0,0.9511,2.0366
+FAISS,100.0,0.0005,0.1508
